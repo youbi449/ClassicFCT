@@ -1,5 +1,16 @@
 local addonName, CFCT = ...
 _G[addonName] = CFCT
+
+-- Configuration par défaut
+CFCT.Config = CFCT.Config or {
+    dynamicOpacityEnabled = true, -- Enables/disables dynamic opacity
+    dynamicOpacityThreshold = 10, -- Number of animations before opacity starts reducing
+    dynamicOpacityMinimum = 0.3, -- Minimum opacity when there are many animations
+    quickFadeForSmallDamage = true, -- Enables/disables quick fade for small damage
+    smallDamageThreshold = 0.3, -- % of average damage below which damage is considered "small"
+    smallDamageFadeSpeed = 1.5, -- Fade speed multiplier for small damage
+}
+
 local IsClassic = (WOW_PROJECT_ID == WOW_PROJECT_CLASSIC)
 local IsBCC = (WOW_PROJECT_ID == WOW_PROJECT_BURNING_CRUSADE_CLASSIC)
 local IsRetail = (WOW_PROJECT_ID == WOW_PROJECT_MAINLINE)
@@ -451,6 +462,18 @@ local ANIMATIONS = {
     FadeOut = function(self, catConfig, animConfig)
         local curAlpha = self:GetAlpha()
         local duration = animConfig.duration
+        local fctConfig = CFCT.Config
+        
+        -- Vérifier si c'est un petit dégât
+        local isSmallDamage = false
+        if fctConfig.quickFadeForSmallDamage and self.state.amount and not self.state.miss then
+            local damageAverage = CFCT:DamageRollingAverage()
+            if damageAverage > 0 and (self.state.amount / damageAverage) < fctConfig.smallDamageThreshold then
+                isSmallDamage = true
+                duration = duration / fctConfig.smallDamageFadeSpeed
+            end
+        end
+        
         local startTime = self.state.initialTime + CFCT.Config.animDuration - duration
         if (now >= startTime) then
             local fadeOutAlpha = AnimateLinearAbsolute(startTime, duration, self.state.fontOptions.fontAlpha, 0)
@@ -654,7 +677,15 @@ local function DispatchText(guid, event, text, amount, spellid, spellicon, perio
     local fctConfig = CFCT.Config
     local catConfig = fctConfig[cat]
     text = text or tostring(amount)
-    -- TODO put fctConfig and catConfig into state
+
+    -- Ajuster l'opacité initiale pour les petits dégâts
+    local initialOpacity = 1
+    if fctConfig.quickFadeForSmallDamage and amount and not miss then
+        local damageAverage = CFCT:DamageRollingAverage()
+        if damageAverage > 0 and (amount / damageAverage) < fctConfig.smallDamageThreshold then
+            initialOpacity = 0.7  -- Opacité réduite pour les petits dégâts
+        end
+    end
 
     count = count or 1
     if (not miss) then
@@ -685,13 +716,13 @@ local function DispatchText(guid, event, text, amount, spellid, spellicon, perio
     local typeColor = periodic and fctConfig.colorTableDotEnabled and GetDotTypeColor(school) or GetDamageTypeColor(school)
     if (catConfig.colorByType == true) and typeColor then
         local r, g, b, a = CFCT.Color2RGBA((strlen(typeColor) == 6) and "FF"..typeColor or typeColor)
-        local a = min(a, select(4, CFCT.Color2RGBA(catConfig.fontColor)))
+        local a = min(a * initialOpacity, select(4, CFCT.Color2RGBA(catConfig.fontColor)))
         fontColor = {r, g, b, a}
         fontAlpha = a
     else
         local r, g, b, a = CFCT.Color2RGBA(catConfig.fontColor)
-        fontColor = {r, g, b, a}
-        fontAlpha = a
+        fontAlpha = a * initialOpacity
+        fontColor = {r, g, b, fontAlpha}
     end
 
     tinsert(anim, 1, GrabFontString():Init({
@@ -701,7 +732,7 @@ local function DispatchText(guid, event, text, amount, spellid, spellicon, perio
         text = text,
         amount = amount,
         miss = miss,
-        baseAlpha = 1,
+        baseAlpha = initialOpacity,
         baseScale = 1,
         fadeAlpha = 1,
         powScale = 1,
@@ -921,12 +952,45 @@ local function PrepareAnimatingFonts()
     end
 end
 
+local function CalculateDynamicOpacity(numAnimations)
+    if not CFCT.Config.dynamicOpacityEnabled then
+        return 1
+    end
+    
+    local threshold = CFCT.Config.dynamicOpacityThreshold
+    local minOpacity = CFCT.Config.dynamicOpacityMinimum
+    
+    if numAnimations <= threshold then
+        return 1
+    end
+    
+    -- Linear opacity calculation between 1 and minOpacity
+    local opacityRange = 1 - minOpacity
+    local excess = numAnimations - threshold
+    local maxExcess = threshold -- Point where minimum opacity is reached
+    local reduction = math.min(excess / maxExcess, 1) * opacityRange
+    
+    return math.max(1 - reduction, minOpacity)
+end
+
 local function UpdateAnimatingFonts()
     local animAreas = SortByUnit(anim)
+    local totalAnimations = 0
+    
+    -- Count total number of animations
+    for _, animArea in pairs(animAreas) do
+        totalAnimations = totalAnimations + #animArea
+    end
+    
+    -- Calculate dynamic opacity
+    local dynamicOpacity = CalculateDynamicOpacity(totalAnimations)
+    
     for k, animArea in pairs(animAreas) do
         for k, frame in ipairs(animArea) do
             frame:UpdateParent(animArea)
             frame:UpdateAnimation()
+            -- Apply dynamic opacity
+            frame.state.baseAlpha = dynamicOpacity
         end
         if CFCT.Config.preventOverlap then
             GridLayout(animArea)
